@@ -15,6 +15,95 @@ interface AnalysisResultsProps {
 export function AnalysisResults({ results, onUploadAnother }: AnalysisResultsProps) {
   const isJsonResponse = typeof results === "object" && results !== null
 
+  const calculateOverallScore = (analysisData: any) => {
+    if (!isJsonResponse || !analysisData) {
+      return 50 // Default score for text responses
+    }
+
+    let totalScore = 0
+    let factors = 0
+
+    // Check for various metrics that might be in the response
+    const metrics = [
+      "clarity",
+      "confidence",
+      "pace",
+      "volume",
+      "articulation",
+      "fluency",
+      "coherence",
+      "engagement",
+      "pronunciation",
+      "intonation",
+    ]
+
+    metrics.forEach((metric) => {
+      if (analysisData[metric] !== undefined) {
+        let value = analysisData[metric]
+
+        // Handle different data types
+        if (typeof value === "string") {
+          // Convert text ratings to numbers
+          const ratings = {
+            excellent: 95,
+            "very good": 85,
+            good: 75,
+            fair: 65,
+            poor: 45,
+            "very poor": 25,
+            high: 85,
+            medium: 65,
+            low: 45,
+          }
+          value = ratings[value.toLowerCase()] || 60
+        } else if (typeof value === "number") {
+          // Normalize numbers to 0-100 scale
+          if (value <= 1)
+            value *= 100 // Handle 0-1 scale
+          else if (value <= 5)
+            value *= 20 // Handle 1-5 scale
+          else if (value <= 10) value *= 10 // Handle 1-10 scale
+        }
+
+        if (typeof value === "number" && value >= 0 && value <= 100) {
+          totalScore += value
+          factors++
+        }
+      }
+    })
+
+    // Check for sentiment or overall assessment
+    if (analysisData.sentiment) {
+      const sentimentScore = analysisData.sentiment === "positive" ? 80 : analysisData.sentiment === "neutral" ? 60 : 40
+      totalScore += sentimentScore
+      factors++
+    }
+
+    // Check for word count or speech length (longer speeches might indicate better preparation)
+    if (analysisData.wordCount || analysisData.duration) {
+      const lengthScore = analysisData.wordCount > 50 || analysisData.duration > 30 ? 70 : 50
+      totalScore += lengthScore
+      factors++
+    }
+
+    // If no recognizable metrics found, analyze the structure
+    if (factors === 0) {
+      const keys = Object.keys(analysisData)
+      if (keys.length > 3) {
+        totalScore = 70 // More detailed analysis suggests better performance
+      } else if (keys.length > 1) {
+        totalScore = 60
+      } else {
+        totalScore = 50
+      }
+      factors = 1
+    }
+
+    return Math.round(totalScore / factors)
+  }
+
+  const overallScore = calculateOverallScore(results)
+
   const handleDownload = () => {
     const dataStr = JSON.stringify(results, null, 2)
     const dataBlob = new Blob([dataStr], { type: "application/json" })
@@ -30,6 +119,29 @@ export function AnalysisResults({ results, onUploadAnother }: AnalysisResultsPro
 
   const generateSuggestions = (analysisData: any) => {
     const suggestions = []
+
+    if (overallScore < 60) {
+      suggestions.push({
+        icon: Volume2,
+        title: "Focus on Fundamentals",
+        tip: "Start with basic speaking exercises. Practice reading aloud daily and record yourself to identify areas for improvement.",
+        priority: "high",
+      })
+    } else if (overallScore < 80) {
+      suggestions.push({
+        icon: Volume2,
+        title: "Vocal Clarity",
+        tip: "Practice speaking at a moderate pace with clear articulation. Record yourself regularly to monitor progress.",
+        priority: "high",
+      })
+    } else {
+      suggestions.push({
+        icon: TrendingUp,
+        title: "Advanced Techniques",
+        tip: "Experiment with advanced speaking techniques like storytelling, rhetorical questions, and strategic pauses.",
+        priority: "medium",
+      })
+    }
 
     // Generic suggestions that apply to most speech analysis
     suggestions.push({
@@ -188,11 +300,15 @@ export function AnalysisResults({ results, onUploadAnother }: AnalysisResultsPro
             <div className="space-y-3">
               <div className="flex justify-between text-sm">
                 <span>Overall Communication Score</span>
-                <span className="font-medium">75%</span>
+                <span className="font-medium">{overallScore}%</span>
               </div>
-              <Progress value={75} className="h-2" />
+              <Progress value={overallScore} className="h-2" />
               <p className="text-xs text-muted-foreground">
-                Keep practicing! Regular recording sessions will help you track improvement over time.
+                {overallScore >= 80
+                  ? "Excellent work! You're demonstrating strong communication skills."
+                  : overallScore >= 60
+                    ? "Good progress! Keep practicing to reach the next level."
+                    : "Keep practicing! Regular recording sessions will help you improve significantly."}
               </p>
             </div>
           </div>
