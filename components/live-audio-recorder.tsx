@@ -25,6 +25,8 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
   const animationFrameRef = useRef<number>()
   const timerRef = useRef<NodeJS.Timeout>()
   const chunksRef = useRef<Blob[]>([])
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const audioCtxRef = useRef<AudioContext | null>(null)
 
   // Request microphone permission
   const requestPermission = useCallback(async () => {
@@ -32,11 +34,13 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       setHasPermission(true)
 
-      // Set up audio level monitoring
-      const audioContext = new AudioContext()
+      // Create and store context so we can clean up on unmount
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
+      audioCtxRef.current = audioContext
       const source = audioContext.createMediaStreamSource(stream)
       const analyzer = audioContext.createAnalyser()
-      analyzer.fftSize = 256
+      analyzer.fftSize = 1024
+      analyzer.smoothingTimeConstant = 0.85
       source.connect(analyzer)
       analyzerRef.current = analyzer
 
@@ -49,18 +53,71 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
     }
   }, [onError])
 
+  // Draw waveform routine
+  const drawWaveform = useCallback(() => {
+    if (!analyzerRef.current || !canvasRef.current) return
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    // Handle HiDPI properly
+    const dpr = window.devicePixelRatio || 1
+    const width = canvas.clientWidth * dpr
+    const height = canvas.clientHeight * dpr
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width
+      canvas.height = height
+    }
+
+    const analyzer = analyzerRef.current
+    const bufferLength = analyzer.fftSize
+    const dataArray = new Uint8Array(bufferLength)
+    analyzer.getByteTimeDomainData(dataArray)
+
+    // Use currentColor from CSS (canvas inherits via className). This keeps theme tokens intact.
+    const computed = getComputedStyle(canvas)
+    const stroke = computed.color || "#22c55e" // fallback green if needed
+    const grid = computed.getPropertyValue("--muted-foreground") || "rgba(0,0,0,0.1)"
+
+    // Clear and draw midline
+    ctx.clearRect(0, 0, width, height)
+    ctx.lineWidth = 1 * dpr
+    ctx.strokeStyle = grid
+    ctx.beginPath()
+    ctx.moveTo(0, height / 2)
+    ctx.lineTo(width, height / 2)
+    ctx.stroke()
+
+    // Draw waveform
+    ctx.lineWidth = 2 * dpr
+    ctx.strokeStyle = stroke
+    ctx.beginPath()
+    const sliceWidth = width / bufferLength
+    let x = 0
+    for (let i = 0; i < bufferLength; i++) {
+      const v = dataArray[i] / 128.0 // 0..2
+      const y = (v * height) / 2
+      if (i === 0) ctx.moveTo(x, y)
+      else ctx.lineTo(x, y)
+      x += sliceWidth
+    }
+    ctx.stroke()
+  }, [])
+
   // Monitor audio levels
   const monitorAudioLevel = useCallback(() => {
     if (!analyzerRef.current) return
+    const freqArray = new Uint8Array(analyzerRef.current.frequencyBinCount)
+    analyzerRef.current.getByteFrequencyData(freqArray)
 
-    const dataArray = new Uint8Array(analyzerRef.current.frequencyBinCount)
-    analyzerRef.current.getByteFrequencyData(dataArray)
+    const average = freqArray.reduce((sum, value) => sum + value, 0) / freqArray.length
+    setAudioLevel(average / 255)
 
-    const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length
-    setAudioLevel(average / 255) // Normalize to 0-1
+    // Draw waveform each frame
+    drawWaveform()
 
     animationFrameRef.current = requestAnimationFrame(monitorAudioLevel)
-  }, [])
+  }, [drawWaveform])
 
   // Start recording
   const startRecording = useCallback(async () => {
@@ -180,6 +237,9 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current)
       }
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {})
+      }
     }
   }, [])
 
@@ -227,13 +287,18 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
               <div
                 className={cn(
                   "h-full transition-all duration-100 rounded-full",
-                  audioLevel > 0.7 ? "bg-red-500" : audioLevel > 0.3 ? "bg-yellow-500" : "bg-green-500",
+                  audioLevel > 0.7 ? "bg-destructive" : audioLevel > 0.3 ? "bg-warning" : "bg-primary",
                 )}
                 style={{ width: `${audioLevel * 100}%` }}
               />
             </div>
           </div>
           {isRecording && <div className="text-sm font-mono text-muted-foreground">{formatTime(recordingTime)}</div>}
+        </div>
+
+        {/* Waveform Canvas */}
+        <div className="rounded-md border bg-card">
+          <canvas ref={canvasRef} className="w-full h-24 text-primary" aria-label="Live waveform visualizer" />
         </div>
 
         {/* Recording Controls */}
@@ -243,7 +308,7 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
               onClick={startRecording}
               disabled={isAnalyzing || hasPermission === null}
               size="lg"
-              className="bg-red-600 hover:bg-red-700"
+              className="bg-primary hover:bg-primary/90 focus-visible:ring-4 focus-visible:ring-primary/40"
             >
               <Mic className="h-4 w-4 mr-2" />
               Start Recording
@@ -259,11 +324,15 @@ export function LiveAudioRecorder({ onAnalysisResult, onError }: LiveAudioRecord
         {/* Recording Status */}
         {isRecording && (
           <div className="text-center">
-            <div className="flex items-center justify-center space-x-2 text-red-600">
-              <div className="w-2 h-2 bg-red-600 rounded-full animate-pulse" />
+            <div className="flex items-center justify-center space-x-3 text-primary">
+              <div className="relative">
+                <span className="absolute inline-flex h-8 w-8 rounded-full bg-primary/40 opacity-30 animate-ping" />
+                <span className="absolute inline-flex h-12 w-12 rounded-full bg-primary/20 opacity-20 animate-ping [animation-delay:.2s]" />
+                <span className="relative inline-flex h-3 w-3 rounded-full bg-primary" />
+              </div>
               <span className="text-sm font-medium">Recording in progress...</span>
             </div>
-            <p className="text-xs text-muted-foreground mt-1">Speak clearly into your microphone</p>
+            <p className="text-xs text-muted-foreground mt-1">Speak clearly and maintain a steady pace</p>
           </div>
         )}
 

@@ -15,91 +15,170 @@ interface AnalysisResultsProps {
 export function AnalysisResults({ results, onUploadAnother }: AnalysisResultsProps) {
   const isJsonResponse = typeof results === "object" && results !== null
 
+  /**
+   * Dynamic scoring algorithm:
+   * - Normalizes heterogeneous inputs (0–1, 1–5, 1–10 scales or text ratings like "good"/"excellent") to 0–100.
+   * - Uses triangular mapping around optimal ranges for pace (WPM), pauses/min, and volume so extremes reduce score.
+   * - Combines metrics with weights and skips missing metrics (weights re-normalize), then clamps result to 0–100.
+   * - Incorporates penalties implicitly via lower sub-scores for filler words, extreme pace, and excessive pauses.
+   */
   const calculateOverallScore = (analysisData: any) => {
-    if (!isJsonResponse || !analysisData) {
-      return 50 // Default score for text responses
+    if (!isJsonResponse || !analysisData) return 50
+
+    // Helpers
+    const clip = (v: number, min = 0, max = 100) => Math.max(min, Math.min(max, v))
+    const ratingMap: Record<string, number> = {
+      excellent: 95,
+      "very good": 88,
+      good: 78,
+      fair: 65,
+      poor: 45,
+      "very poor": 25,
+      high: 85,
+      medium: 65,
+      low: 45,
+      positive: 80,
+      neutral: 60,
+      negative: 40,
     }
-
-    let totalScore = 0
-    let factors = 0
-
-    // Check for various metrics that might be in the response
-    const metrics = [
-      "clarity",
-      "confidence",
-      "pace",
-      "volume",
-      "articulation",
-      "fluency",
-      "coherence",
-      "engagement",
-      "pronunciation",
-      "intonation",
-    ]
-
-    metrics.forEach((metric) => {
-      if (analysisData[metric] !== undefined) {
-        let value = analysisData[metric]
-
-        // Handle different data types
-        if (typeof value === "string") {
-          // Convert text ratings to numbers
-          const ratings = {
-            excellent: 95,
-            "very good": 85,
-            good: 75,
-            fair: 65,
-            poor: 45,
-            "very poor": 25,
-            high: 85,
-            medium: 65,
-            low: 45,
-          }
-          value = ratings[value.toLowerCase()] || 60
-        } else if (typeof value === "number") {
-          // Normalize numbers to 0-100 scale
-          if (value <= 1)
-            value *= 100 // Handle 0-1 scale
-          else if (value <= 5)
-            value *= 20 // Handle 1-5 scale
-          else if (value <= 10) value *= 10 // Handle 1-10 scale
+    const normalizeNumberOrRating = (v: any): number | undefined => {
+      if (v == null) return undefined
+      if (typeof v === "string") {
+        const key = v.toLowerCase().trim()
+        return ratingMap[key] ?? undefined
+      }
+      if (typeof v === "number") {
+        if (v >= 0 && v <= 1) return v * 100
+        if (v > 1 && v <= 5) return (v / 5) * 100
+        if (v > 5 && v <= 10) return (v / 10) * 100
+        if (v > 10 && v <= 100) return clip(v)
+        return clip(v)
+      }
+      return undefined
+    }
+    const fromKeys = (...keys: string[]) => {
+      for (const k of keys) {
+        if (analysisData && Object.prototype.hasOwnProperty.call(analysisData, k) && analysisData[k] != null) {
+          return analysisData[k]
         }
-
-        if (typeof value === "number" && value >= 0 && value <= 100) {
-          totalScore += value
-          factors++
+        if (
+          analysisData?.metrics &&
+          Object.prototype.hasOwnProperty.call(analysisData.metrics, k) &&
+          analysisData.metrics[k] != null
+        ) {
+          return analysisData.metrics[k]
         }
       }
-    })
-
-    // Check for sentiment or overall assessment
-    if (analysisData.sentiment) {
-      const sentimentScore = analysisData.sentiment === "positive" ? 80 : analysisData.sentiment === "neutral" ? 60 : 40
-      totalScore += sentimentScore
-      factors++
+      return undefined
+    }
+    const triangularScore = (value: number | undefined, target: number, tolerance: number) => {
+      if (value == null || isNaN(value)) return undefined
+      const delta = Math.abs(value - target)
+      const ratio = clip(1 - delta / tolerance, 0, 1)
+      return Math.round(ratio * 100)
     }
 
-    // Check for word count or speech length (longer speeches might indicate better preparation)
-    if (analysisData.wordCount || analysisData.duration) {
-      const lengthScore = analysisData.wordCount > 50 || analysisData.duration > 30 ? 70 : 50
-      totalScore += lengthScore
-      factors++
+    // Derived metrics
+    const wordCount = Number(fromKeys("wordCount", "words"))
+    const durationSec = Number(fromKeys("duration", "durationSec", "seconds"))
+    let wpm = Number(fromKeys("wordsPerMinute", "wpm", "paceWpm", "speech_rate", "rate"))
+    if ((!wpm || isNaN(wpm)) && wordCount && durationSec && durationSec > 0) {
+      wpm = (wordCount / durationSec) * 60
     }
 
-    // If no recognizable metrics found, analyze the structure
-    if (factors === 0) {
+    let fillerRate = Number(fromKeys("fillerWordRate", "fillerRate"))
+    const fillerCount = Number(fromKeys("fillerWordCount", "fillerCount", "umUhCount"))
+    if ((isNaN(fillerRate) || !isFinite(fillerRate)) && fillerCount && wordCount) {
+      fillerRate = fillerCount / wordCount
+    }
+    const pausesPerMinute = Number(fromKeys("pausesPerMinute", "pauseRate", "pauses_pm"))
+
+    const volume = fromKeys("volume", "loudness", "rms")
+    const sentiment = fromKeys("sentiment", "polarity")
+
+    // Normalized components (0–100 higher is better)
+    const clarity = normalizeNumberOrRating(fromKeys("clarity"))
+    const confidence = normalizeNumberOrRating(fromKeys("confidence"))
+    const articulation = normalizeNumberOrRating(fromKeys("articulation"))
+    const fluency = normalizeNumberOrRating(fromKeys("fluency"))
+    const coherence = normalizeNumberOrRating(fromKeys("coherence"))
+    const engagement = normalizeNumberOrRating(fromKeys("engagement"))
+    const pronunciation = normalizeNumberOrRating(fromKeys("pronunciation"))
+    const intonation = normalizeNumberOrRating(fromKeys("intonation"))
+
+    const paceScore = wpm != null && isFinite(wpm) ? triangularScore(wpm, 150, 50) : undefined
+    const pausesScore =
+      pausesPerMinute != null && isFinite(pausesPerMinute) ? triangularScore(pausesPerMinute, 6, 5) : undefined
+    const volumeScore = normalizeNumberOrRating(volume) ?? triangularScore(Number(volume), 60, 25)
+
+    let fillerScore: number | undefined
+    if (fillerRate != null && isFinite(fillerRate)) {
+      // 0% fillers => 100; 5% => 0. Linear drop-off
+      const pct = clip(fillerRate * 100)
+      fillerScore = clip(100 - (pct / 5) * 100)
+    }
+
+    let sentimentScore: number | undefined
+    if (typeof sentiment === "string") {
+      sentimentScore = ratingMap[sentiment.toLowerCase()] ?? 60
+    } else if (typeof sentiment === "number") {
+      // Map -1..1 to 0..100
+      const s = clip(((sentiment + 1) / 2) * 100)
+      sentimentScore = s
+    }
+
+    // Weights
+    const weights: Record<string, number> = {
+      clarity: 0.12,
+      confidence: 0.12,
+      fluency: 0.1,
+      articulation: 0.08,
+      coherence: 0.08,
+      engagement: 0.06,
+      pronunciation: 0.08,
+      intonation: 0.06,
+      pace: 0.12,
+      volume: 0.06,
+      filler: 0.06,
+      pauses: 0.06,
+      sentiment: 0.1,
+    }
+
+    const acc = { sum: 0, w: 0, n: 0 }
+    const add = (score: number | undefined, key: keyof typeof weights) => {
+      if (score == null || isNaN(score)) return
+      acc.sum += clip(score) * weights[key]
+      acc.w += weights[key]
+      acc.n += 1
+    }
+
+    add(clarity, "clarity")
+    add(confidence, "confidence")
+    add(fluency, "fluency")
+    add(articulation, "articulation")
+    add(coherence, "coherence")
+    add(engagement, "engagement")
+    add(pronunciation, "pronunciation")
+    add(intonation, "intonation")
+    add(paceScore, "pace")
+    add(volumeScore, "volume")
+    add(fillerScore, "filler")
+    add(pausesScore, "pauses")
+    add(sentimentScore, "sentiment")
+
+    if (acc.w === 0) {
       const keys = Object.keys(analysisData)
-      if (keys.length > 3) {
-        totalScore = 70 // More detailed analysis suggests better performance
-      } else if (keys.length > 1) {
-        totalScore = 60
-      } else {
-        totalScore = 50
-      }
-      factors = 1
+      return keys.length > 3 ? 70 : keys.length > 1 ? 60 : 50
     }
 
-    return Math.round(totalScore / factors)
+    const overallWeighted = acc.sum / acc.w
+
+    // When only 1–2 metrics are available, avoid extreme 0/100 by blending with a neutral baseline
+    const baseline = 60
+    const blendFactor = acc.n === 1 ? 0.6 : acc.n === 2 ? 0.3 : 0 // higher factor => closer to baseline
+    const mixed = overallWeighted * (1 - blendFactor) + baseline * blendFactor
+
+    return Math.round(clip(mixed, 0, 100))
   }
 
   const overallScore = calculateOverallScore(results)
